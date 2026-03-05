@@ -3,10 +3,14 @@
 Discord AI Voice Bot
 Joins voice → captures speech → Whisper STT → LLM (streaming) → TTS
 
-Supports macOS and Windows. TTS uses pyttsx3 (local, no API key required):
-  - macOS: NSSpeechSynthesizer (same voices as `say`)
-  - Windows: SAPI5 voices
-  - Linux: espeak
+TTS uses Kokoro — a local neural TTS model with human-quality voices.
+Runs fully on-device (no API key, no internet after first-run model download).
+Supports Apple Silicon MPS and CUDA for fast inference.
+
+Available voices (set TTS_VOICE in .env):
+  American English: af_heart (default), af_bella, af_sarah, af_nicole,
+                    am_michael, am_adam, am_echo
+  British English:  bf_emma, bf_isabella, bm_george, bm_lewis
 
 LLM uses LiteLLM — swap providers by changing LLM_MODEL in .env:
   - Claude:      claude-haiku-4-5-20251001  (set ANTHROPIC_API_KEY)
@@ -32,7 +36,9 @@ import aiohttp
 import davey
 import discord
 import litellm
-import pyttsx3
+import numpy as np
+import soundfile as sf
+from kokoro import KPipeline
 from discord.ext import voice_recv
 from discord.opus import Decoder as OpusDecoder
 from dotenv import load_dotenv
@@ -59,14 +65,16 @@ def _require(key: str) -> str:
 
 BOT_TOKEN        = _require("DISCORD_BOT_TOKEN")
 OWNER_ID         = int(_require("DISCORD_OWNER_ID"))
-# LLM API key is NOT required here — LiteLLM reads provider-specific env vars
-# automatically (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) at call time.
 WHISPER_URL      = os.environ.get("WHISPER_URL", "http://127.0.0.1:8765/inference")
 MODEL            = os.environ.get("LLM_MODEL", "claude-haiku-4-5-20251001")
-TTS_VOICE        = os.environ.get("TTS_VOICE", "Samantha")
+TTS_VOICE        = os.environ.get("TTS_VOICE", "af_heart")
+TTS_SPEED        = float(os.environ.get("TTS_SPEED", "1.0"))
 SILENCE_SEC      = float(os.environ.get("SILENCE_SEC", "0.7"))
 MIN_DURATION_SEC = float(os.environ.get("MIN_DURATION_SEC", "0.4"))
 MAX_HISTORY      = 10
+
+# Kokoro lang_code is derived from the voice prefix (a=American, b=British, j=Japanese)
+_LANG_CODE = TTS_VOICE[0] if TTS_VOICE else "a"
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+|(?<=[.!?])$')
 
@@ -88,9 +96,9 @@ else:
 
 conversation_history: list = []
 _speaking = threading.Event()          # set while bot is playing TTS
-_tts_engine: pyttsx3.Engine | None = None
-_tts_lock = threading.Lock()           # pyttsx3 is not thread-safe
-_http_session: aiohttp.ClientSession | None = None   # persistent session
+_kokoro: KPipeline | None = None
+_tts_lock = threading.Lock()           # KPipeline is not thread-safe
+_http_session: aiohttp.ClientSession | None = None
 
 # ── Discord setup ─────────────────────────────────────────────────────────────
 
@@ -99,28 +107,25 @@ intents.voice_states = True
 bot = discord.Client(intents=intents)
 
 
-# ── TTS engine ────────────────────────────────────────────────────────────────
+# ── TTS (Kokoro) ──────────────────────────────────────────────────────────────
 
-def _init_tts_engine() -> pyttsx3.Engine:
-    engine = pyttsx3.init()
-    voices = engine.getProperty("voices")
-    for v in voices:
-        name = (v.name or "").lower()
-        vid = (v.id or "").lower()
-        if TTS_VOICE.lower() in name or TTS_VOICE.lower() in vid:
-            engine.setProperty("voice", v.id)
-            log.info("TTS voice selected: %s", v.name)
-            break
-    else:
-        log.warning("TTS voice %r not found; using system default", TTS_VOICE)
-    return engine
+def _init_kokoro() -> KPipeline:
+    """
+    Initialize the Kokoro pipeline. Downloads the model on first run (~350MB,
+    cached to ~/.cache/huggingface/). Subsequent runs are fully offline.
+    Uses Apple Silicon MPS or CUDA if available, otherwise CPU.
+    """
+    log.info("Loading Kokoro TTS model (may download on first run)...")
+    pipeline = KPipeline(lang_code=_LANG_CODE)
+    log.info("Kokoro ready — voice=%s speed=%.1f", TTS_VOICE, TTS_SPEED)
+    return pipeline
 
 
 async def _tts_start(text: str) -> str | None:
     """
-    Generate TTS audio to a temp WAV file via pyttsx3.
-    Runs in a thread executor so the event loop stays unblocked.
-    Returns the temp file path when audio is ready, or None on error.
+    Generate TTS audio to a temp WAV file via Kokoro.
+    Runs in a thread executor so the event loop stays unblocked while
+    the model does inference. Returns the temp file path when ready.
     """
     loop = asyncio.get_event_loop()
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="discord_voice_tts_")
@@ -128,11 +133,18 @@ async def _tts_start(text: str) -> str | None:
 
     def _generate() -> None:
         with _tts_lock:
-            _tts_engine.save_to_file(text, tmp_path)
-            _tts_engine.runAndWait()
+            chunks = []
+            for _, _, audio in _kokoro(text, voice=TTS_VOICE, speed=TTS_SPEED):
+                chunks.append(audio)
+            if not chunks:
+                raise RuntimeError("Kokoro returned no audio")
+            full_audio = np.concatenate(chunks)
+            sf.write(tmp_path, full_audio, 24000)
 
     try:
+        t0 = time.monotonic()
         await loop.run_in_executor(None, _generate)
+        log.debug("[TTS %.0fms] %r", (time.monotonic() - t0) * 1000, text)
         return tmp_path
     except Exception as e:
         log.error("TTS generation failed: %s", e)
@@ -161,7 +173,7 @@ class VoiceSink(voice_recv.AudioSink):
         self._checker.start()
 
     def wants_opus(self) -> bool:
-        return True  # we handle DAVE decrypt + Opus decode ourselves
+        return True
 
     def write(self, user: discord.Member | None, data: voice_recv.VoiceData) -> None:
         if _speaking.is_set():
@@ -173,7 +185,6 @@ class VoiceSink(voice_recv.AudioSink):
         if not raw:
             return
 
-        # Handle Discord E2EE (DAVE protocol) transparently
         conn = getattr(self._vc, "_connection", None)
         dave_session = getattr(conn, "dave_session", None)
         if dave_session and dave_session.ready:
@@ -238,10 +249,7 @@ class VoiceSink(voice_recv.AudioSink):
 # ── Transcription ─────────────────────────────────────────────────────────────
 
 async def transcribe(raw_pcm: bytes) -> str | None:
-    """
-    Convert raw 48kHz stereo PCM → 16kHz mono WAV via ffmpeg pipe (no temp
-    file), then POST WAV bytes to whisper-server via the persistent aiohttp session.
-    """
+    """Convert raw 48kHz stereo PCM → 16kHz mono WAV via ffmpeg, POST to whisper-server."""
     global _http_session
 
     proc = await asyncio.create_subprocess_exec(
@@ -282,9 +290,9 @@ async def transcribe(raw_pcm: bytes) -> str | None:
 
 async def respond(transcript: str, vc: voice_recv.VoiceRecvClient) -> None:
     """
-    Stream LLM response via LiteLLM. For each sentence boundary, generate TTS
-    audio to a temp file and queue it for playback. TTS generation runs in a
-    thread executor so playback of the previous sentence continues concurrently.
+    Stream LLM response via LiteLLM. At each sentence boundary, generate Kokoro
+    TTS audio in an executor and queue it for playback. Sentence N+1 audio is
+    generated while sentence N is playing.
     """
     global conversation_history
 
@@ -350,7 +358,7 @@ async def _play_file_queue(
     vc: voice_recv.VoiceRecvClient,
     q: asyncio.Queue[str | None],
 ) -> None:
-    """Play TTS audio files sequentially from the queue."""
+    """Play Kokoro WAV files sequentially from the queue."""
     while True:
         item = await q.get()
         if item is None:
@@ -406,12 +414,11 @@ async def shutdown() -> None:
 
 @bot.event
 async def on_ready():
-    global _http_session, _tts_engine
+    global _http_session, _kokoro
     _http_session = aiohttp.ClientSession()
-    _tts_engine = _init_tts_engine()
+    _kokoro = _init_kokoro()
     log.info("Logged in as %s (id=%d)", bot.user, bot.user.id)
 
-    # SIGTERM handler — Unix only (Windows doesn't support add_signal_handler)
     if sys.platform != "win32":
         loop = asyncio.get_event_loop()
         loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(shutdown()))
@@ -461,7 +468,6 @@ async def join_channel(
 
     await asyncio.sleep(0.5)
 
-    # Greeting
     greeting_path = await _tts_start("Hey, I'm here.")
     if greeting_path:
         done = asyncio.Event()
