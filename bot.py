@@ -67,6 +67,7 @@ BOT_TOKEN        = _require("DISCORD_BOT_TOKEN")
 OWNER_ID         = int(_require("DISCORD_OWNER_ID"))
 WHISPER_URL      = os.environ.get("WHISPER_URL", "http://127.0.0.1:8765/inference")
 MODEL            = os.environ.get("LLM_MODEL", "claude-haiku-4-5-20251001")
+STATUS_PORT      = int(os.environ.get("STATUS_PORT", "18795"))
 TTS_VOICE        = os.environ.get("TTS_VOICE", "af_heart")
 TTS_SPEED        = float(os.environ.get("TTS_SPEED", "1.0"))
 # Paths to the ONNX model and voices files (downloaded separately — see README)
@@ -414,12 +415,34 @@ async def shutdown() -> None:
 
 # ── Bot events ────────────────────────────────────────────────────────────────
 
+async def _status_server() -> None:
+    """Minimal TCP HTTP server for health checks (GET /status → 200 OK)."""
+    _RESPONSE = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}"
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read(256)
+            writer.write(_RESPONSE)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(_handle, "127.0.0.1", STATUS_PORT)
+    log.info("Status endpoint: http://127.0.0.1:%d/status", STATUS_PORT)
+    async with server:
+        await server.serve_forever()
+
+
 @bot.event
 async def on_ready():
     global _http_session, _kokoro
     _http_session = aiohttp.ClientSession()
     _kokoro = _init_kokoro()
     log.info("Logged in as %s (id=%d)", bot.user, bot.user.id)
+
+    asyncio.create_task(_status_server())
 
     if sys.platform != "win32":
         loop = asyncio.get_event_loop()
