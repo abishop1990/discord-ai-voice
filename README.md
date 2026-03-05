@@ -1,8 +1,8 @@
 # discord-ai-voice
 
 A Discord voice bot that listens, thinks, and speaks — using local Whisper STT,
-Claude LLM, and macOS `say` TTS. Sub-second response latency via streaming and
-FIFO-pipe audio.
+any LLM via LiteLLM, and local TTS via pyttsx3. Works on macOS and Windows with
+no code changes.
 
 Built to work with Discord's E2EE (DAVE protocol) introduced in March 2026, which
 broke most existing voice bots that relied on pre-DAVE decryption paths.
@@ -21,26 +21,34 @@ Discord voice channel
         ▼ HTTP POST
    whisper.cpp server  →  transcript text
         │
-        ▼ streaming API
-   Claude (Anthropic)  →  text tokens
+        ▼ streaming API (LiteLLM)
+   Claude / GPT-4o / Gemini / Ollama / ...  →  text tokens
         │
-        ▼ sentence boundaries
-   macOS say → AIFF via named FIFO
+        ▼ sentence boundaries → pyttsx3 (thread executor)
+   WAV temp file
         │
         ▼ FFmpegPCMAudio
    Discord voice channel (playback)
 ```
 
-Latency budget (typical): ~120ms STT + ~300ms LLM first token + ~50ms TTS = **~500ms**
-from end of speech to start of response.
+Typical latency: ~120ms STT + ~300ms LLM first token + ~150ms TTS = **~600ms**
+from end of speech to start of response. TTS generation for sentence N+1 runs
+concurrently with playback of sentence N.
 
 ## Prerequisites
 
-- **macOS** (uses `say` for TTS and named FIFOs)
+**macOS:**
 - Python 3.11+
-- `ffmpeg` (`brew install ffmpeg`)
+- `brew install ffmpeg`
 - A running [whisper.cpp server](#whisper-server-setup)
-- A Discord bot with Voice Activity permissions
+
+**Windows:**
+- Python 3.11+
+- `winget install ffmpeg`
+- `pip install pywin32` (required by pyttsx3 for SAPI)
+- A running [whisper.cpp server](#whisper-server-setup)
+
+Both: a Discord bot with Voice Activity permissions (see [Discord Bot Setup](#discord-bot-setup)).
 
 ## Quick Start
 
@@ -51,18 +59,19 @@ cd discord-ai-voice
 
 # 2. Create virtualenv
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate      # macOS/Linux
+# venv\Scripts\activate       # Windows
 
 # 3. Install dependencies
 pip install -r requirements.txt
 
 # 4. Configure
 cp .env.example .env
-# Edit .env with your credentials (see Environment Variables below)
+# Edit .env — at minimum set DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and your LLM API key
 
 # 5. (Optional) Customize persona
 cp persona.example.txt persona.txt
-# Edit persona.txt to set the bot's personality and style
+# Edit persona.txt
 
 # 6. Run
 python bot.py
@@ -74,12 +83,12 @@ The bot expects a [whisper.cpp](https://github.com/ggerganov/whisper.cpp) HTTP
 server running locally.
 
 ```bash
-# Clone and build whisper.cpp
+# Clone and build
 git clone https://github.com/ggerganov/whisper.cpp.git
 cd whisper.cpp
 make
 
-# Download a model (ggml-base.en is fast and accurate enough for voice chat)
+# Download a model (base.en is fast and accurate enough for voice chat)
 bash ./models/download-ggml-model.sh base.en
 
 # Start the server (default port 8765)
@@ -99,30 +108,53 @@ bash ./models/download-ggml-model.sh base.en
 |---|---|---|---|
 | `DISCORD_BOT_TOKEN` | Yes | — | Bot token from Discord Developer Portal |
 | `DISCORD_OWNER_ID` | Yes | — | Your Discord user ID (right-click → Copy User ID) |
-| `ANTHROPIC_API_KEY` | Yes | — | API key from console.anthropic.com |
+| `LLM_MODEL` | No | `claude-haiku-4-5-20251001` | LiteLLM model string (see table below) |
 | `WHISPER_URL` | No | `http://127.0.0.1:8765/inference` | whisper.cpp server endpoint |
-| `LLM_MODEL` | No | `claude-haiku-4-5-20251001` | Anthropic model ID |
-| `TTS_VOICE` | No | `Samantha` | macOS voice name (`say -v ?` to list) |
+| `TTS_VOICE` | No | `Samantha` | Partial voice name match (case-insensitive) |
 | `SILENCE_SEC` | No | `0.7` | Seconds of silence before processing audio |
-| `MIN_DURATION_SEC` | No | `0.4` | Minimum audio duration to process (filters noise) |
+| `MIN_DURATION_SEC` | No | `0.4` | Minimum audio duration (filters noise) |
 | `PERSONA_FILE` | No | `persona.txt` | Path to persona file (loaded if it exists) |
 | `SYSTEM_PROMPT` | No | built-in default | Inline system prompt (used if no persona file) |
 
-The bot only listens to and responds to the owner (`DISCORD_OWNER_ID`). It joins
-and leaves voice channels automatically as the owner does.
+### LLM Providers
+
+Switch providers by changing `LLM_MODEL` and setting the matching API key env var:
+
+| Provider | `LLM_MODEL` example | API key env var |
+|---|---|---|
+| **Anthropic Claude** | `claude-haiku-4-5-20251001` | `ANTHROPIC_API_KEY` |
+| **OpenAI** | `gpt-4o` | `OPENAI_API_KEY` |
+| **Google Gemini** | `gemini/gemini-2.0-flash` | `GEMINI_API_KEY` |
+| **OpenRouter** | `openrouter/anthropic/claude-haiku-4-5-20251001` | `OPENROUTER_API_KEY` |
+| **Ollama (local)** | `ollama/llama3` | none — set `OLLAMA_API_BASE=http://localhost:11434` |
+
+LiteLLM picks up the API key from the environment automatically based on the model prefix.
+
+## TTS Voices
+
+The bot uses pyttsx3 for local TTS — no API key or internet required.
+
+**List available voices on your system:**
+```bash
+python -c "import pyttsx3; e=pyttsx3.init(); [print(v.name) for v in e.getProperty('voices')]"
+```
+
+Set `TTS_VOICE` to any partial name from that list (case-insensitive match):
+- macOS: `Samantha`, `Alex`, `Moira`, `Daniel`, etc.
+- Windows: `Microsoft Zira Desktop`, `Microsoft David Desktop`, etc.
+
+> **Note:** pyttsx3 generates the full audio for each sentence before playback begins.
+> This adds ~100–200ms of latency compared to a streaming approach, but works
+> identically on all platforms with no external dependencies.
 
 ## Persona Customization
 
-Create `persona.txt` (or copy `persona.example.txt`) to customize the bot's
-personality. The file contents become the system prompt sent to Claude.
+Create `persona.txt` (or copy `persona.example.txt`) to set the bot's personality.
+The file contents become the system prompt sent to the LLM.
 
-Keep it concise — Claude works better with focused instructions than long essays.
-A few sentences about tone, style, and response length is usually enough.
+Keep it concise — a few sentences about tone, style, and response length is enough.
 
 ## Running as a macOS LaunchAgent
-
-To start the bot automatically at login, create a LaunchAgent plist. Replace
-the placeholder paths with your actual paths:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -165,10 +197,6 @@ Save as `~/Library/LaunchAgents/com.yourname.discord-ai-voice.plist`, then:
 ```bash
 launchctl load ~/Library/LaunchAgents/com.yourname.discord-ai-voice.plist
 ```
-
-> **Note:** If using a LaunchAgent, you can put credentials in the plist's
-> `EnvironmentVariables` dict instead of a `.env` file. Either approach works —
-> never commit either one to git.
 
 ## License
 

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
 Discord AI Voice Bot
-Joins voice → captures speech → whisper STT → Claude (streaming) → macOS TTS
+Joins voice → captures speech → Whisper STT → LLM (streaming) → TTS
 
-Latency optimizations:
-  1. SILENCE_SEC=0.7: trigger processing quickly after user stops talking
-  2. ffmpeg pipes WAV to whisper in-memory (no temp file)
-  3. Persistent aiohttp session (no per-request TCP handshake)
-  4. Anthropic streaming: TTS starts on first sentence boundary (~100ms)
-  5. FIFO-pipe TTS: say and Discord ffmpeg run concurrently, playback starts
-     ~50ms after say starts (not after it finishes)
+Supports macOS and Windows. TTS uses pyttsx3 (local, no API key required):
+  - macOS: NSSpeechSynthesizer (same voices as `say`)
+  - Windows: SAPI5 voices
+  - Linux: espeak
+
+LLM uses LiteLLM — swap providers by changing LLM_MODEL in .env:
+  - Claude:      claude-haiku-4-5-20251001  (set ANTHROPIC_API_KEY)
+  - OpenAI:      gpt-4o                     (set OPENAI_API_KEY)
+  - Gemini:      gemini/gemini-2.0-flash    (set GEMINI_API_KEY)
+  - Ollama:      ollama/llama3              (set OLLAMA_API_BASE)
+  - OpenRouter:  openrouter/...             (set OPENROUTER_API_KEY)
 
 Discord E2EE (DAVE): handled transparently via the davey library.
 """
@@ -19,17 +23,18 @@ import logging
 import os
 import re
 import signal
-import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 import aiohttp
 import davey
 import discord
+import litellm
+import pyttsx3
 from discord.ext import voice_recv
 from discord.opus import Decoder as OpusDecoder
-from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,6 +45,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("discord-ai-voice")
+litellm.suppress_debug_info = True
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -53,7 +59,8 @@ def _require(key: str) -> str:
 
 BOT_TOKEN        = _require("DISCORD_BOT_TOKEN")
 OWNER_ID         = int(_require("DISCORD_OWNER_ID"))
-ANTHROPIC_KEY    = _require("ANTHROPIC_API_KEY")
+# LLM API key is NOT required here — LiteLLM reads provider-specific env vars
+# automatically (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) at call time.
 WHISPER_URL      = os.environ.get("WHISPER_URL", "http://127.0.0.1:8765/inference")
 MODEL            = os.environ.get("LLM_MODEL", "claude-haiku-4-5-20251001")
 TTS_VOICE        = os.environ.get("TTS_VOICE", "Samantha")
@@ -80,16 +87,60 @@ else:
 # ── State ─────────────────────────────────────────────────────────────────────
 
 conversation_history: list = []
-_speaking = threading.Event()   # set while bot is playing TTS
-async_anthropic = AsyncAnthropic(api_key=ANTHROPIC_KEY)
+_speaking = threading.Event()          # set while bot is playing TTS
+_tts_engine: pyttsx3.Engine | None = None
+_tts_lock = threading.Lock()           # pyttsx3 is not thread-safe
 _http_session: aiohttp.ClientSession | None = None   # persistent session
-_fifo_counter = 0                                     # unique FIFO names
 
 # ── Discord setup ─────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.voice_states = True
 bot = discord.Client(intents=intents)
+
+
+# ── TTS engine ────────────────────────────────────────────────────────────────
+
+def _init_tts_engine() -> pyttsx3.Engine:
+    engine = pyttsx3.init()
+    voices = engine.getProperty("voices")
+    for v in voices:
+        name = (v.name or "").lower()
+        vid = (v.id or "").lower()
+        if TTS_VOICE.lower() in name or TTS_VOICE.lower() in vid:
+            engine.setProperty("voice", v.id)
+            log.info("TTS voice selected: %s", v.name)
+            break
+    else:
+        log.warning("TTS voice %r not found; using system default", TTS_VOICE)
+    return engine
+
+
+async def _tts_start(text: str) -> str | None:
+    """
+    Generate TTS audio to a temp WAV file via pyttsx3.
+    Runs in a thread executor so the event loop stays unblocked.
+    Returns the temp file path when audio is ready, or None on error.
+    """
+    loop = asyncio.get_event_loop()
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="discord_voice_tts_")
+    os.close(tmp_fd)
+
+    def _generate() -> None:
+        with _tts_lock:
+            _tts_engine.save_to_file(text, tmp_path)
+            _tts_engine.runAndWait()
+
+    try:
+        await loop.run_in_executor(None, _generate)
+        return tmp_path
+    except Exception as e:
+        log.error("TTS generation failed: %s", e)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None
 
 
 # ── Audio sink ────────────────────────────────────────────────────────────────
@@ -189,12 +240,10 @@ class VoiceSink(voice_recv.AudioSink):
 async def transcribe(raw_pcm: bytes) -> str | None:
     """
     Convert raw 48kHz stereo PCM → 16kHz mono WAV via ffmpeg pipe (no temp
-    file), then POST WAV bytes directly to whisper-server via the persistent
-    aiohttp session.
+    file), then POST WAV bytes to whisper-server via the persistent aiohttp session.
     """
     global _http_session
 
-    # ffmpeg: PCM stdin → WAV stdout (no disk I/O)
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y",
         "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
@@ -233,10 +282,9 @@ async def transcribe(raw_pcm: bytes) -> str | None:
 
 async def respond(transcript: str, vc: voice_recv.VoiceRecvClient) -> None:
     """
-    Stream Anthropic response. For each sentence, open a named FIFO, start
-    `say` writing to it, then hand the FIFO to discord's FFmpegPCMAudio.
-    `say` and ffmpeg run concurrently → playback starts ~50ms after say starts
-    rather than ~200ms after it finishes.
+    Stream LLM response via LiteLLM. For each sentence boundary, generate TTS
+    audio to a temp file and queue it for playback. TTS generation runs in a
+    thread executor so playback of the previous sentence continues concurrently.
     """
     global conversation_history
 
@@ -244,46 +292,47 @@ async def respond(transcript: str, vc: voice_recv.VoiceRecvClient) -> None:
     if len(conversation_history) > MAX_HISTORY * 2:
         conversation_history = conversation_history[-(MAX_HISTORY * 2):]
 
-    # fifo_queue: (fifo_path, say_proc) tuples, or None = end
-    fifo_queue: asyncio.Queue[tuple[str, subprocess.Popen] | None] = asyncio.Queue()
+    tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
     _speaking.set()
 
-    player_task = asyncio.create_task(_play_fifo_queue(vc, fifo_queue))
+    player_task = asyncio.create_task(_play_file_queue(vc, tts_queue))
 
     full_reply = ""
     buffer = ""
     t_first_token: float | None = None
     try:
-        async with async_anthropic.messages.stream(
+        llm_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
+        response = await litellm.acompletion(
             model=MODEL,
+            messages=llm_messages,
             max_tokens=300,
-            system=SYSTEM_PROMPT,
-            messages=conversation_history,
-        ) as stream:
-            async for token in stream.text_stream:
-                if t_first_token is None:
-                    t_first_token = time.monotonic()
-                buffer += token
-                full_reply += token
+            stream=True,
+        )
+        async for chunk in response:
+            if t_first_token is None:
+                t_first_token = time.monotonic()
+            token = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+            buffer += token
+            full_reply += token
 
-                while True:
-                    m = _SENTENCE_END.search(buffer)
-                    if not m:
-                        break
-                    sentence = buffer[: m.start() + 1].strip()
-                    buffer = buffer[m.end():]
-                    if len(sentence) > 2:
-                        item = await _tts_start(sentence)
-                        if item:
-                            await fifo_queue.put(item)
+            while True:
+                m = _SENTENCE_END.search(buffer)
+                if not m:
+                    break
+                sentence = buffer[: m.start() + 1].strip()
+                buffer = buffer[m.end():]
+                if len(sentence) > 2:
+                    file_path = await _tts_start(sentence)
+                    if file_path:
+                        await tts_queue.put(file_path)
 
         tail = buffer.strip()
         if len(tail) > 2:
-            item = await _tts_start(tail)
-            if item:
-                await fifo_queue.put(item)
+            file_path = await _tts_start(tail)
+            if file_path:
+                await tts_queue.put(file_path)
 
-        await fifo_queue.put(None)
+        await tts_queue.put(None)
         await player_task
 
         conversation_history.append({"role": "assistant", "content": full_reply.strip()})
@@ -291,54 +340,26 @@ async def respond(transcript: str, vc: voice_recv.VoiceRecvClient) -> None:
 
     except Exception:
         log.exception("respond() error")
-        await fifo_queue.put(None)
+        await tts_queue.put(None)
         player_task.cancel()
     finally:
         _speaking.clear()
 
 
-async def _tts_start(text: str) -> tuple[str, subprocess.Popen] | None:
-    """
-    Create a named FIFO and start `say` writing AIFF to it.
-    Returns (fifo_path, say_proc) immediately — say runs in background.
-    The caller passes fifo_path to FFmpegPCMAudio; when ffmpeg opens the FIFO
-    for reading, say unblocks and streams audio concurrently.
-    """
-    global _fifo_counter
-    _fifo_counter += 1
-    fifo_path = f"/tmp/discord_voice_tts_{os.getpid()}_{_fifo_counter}.fifo"
-
-    try:
-        os.unlink(fifo_path)
-    except OSError:
-        pass
-    os.mkfifo(fifo_path)
-
-    # Start say immediately — it will block at open(fifo_path, O_WRONLY)
-    # until FFmpegPCMAudio's ffmpeg subprocess opens the read end.
-    say_proc = subprocess.Popen(
-        ["say", "-v", TTS_VOICE, "--", text, "-o", fifo_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return (fifo_path, say_proc)
-
-
-async def _play_fifo_queue(
+async def _play_file_queue(
     vc: voice_recv.VoiceRecvClient,
-    q: asyncio.Queue[tuple[str, subprocess.Popen] | None],
+    q: asyncio.Queue[str | None],
 ) -> None:
-    """Play FIFO-backed TTS items sequentially."""
+    """Play TTS audio files sequentially from the queue."""
     while True:
         item = await q.get()
         if item is None:
             break
-        fifo_path, say_proc = item
+        file_path = item
         try:
             if not vc.is_connected():
-                say_proc.kill()
                 try:
-                    os.unlink(fifo_path)
+                    os.unlink(file_path)
                 except OSError:
                     pass
                 continue
@@ -348,26 +369,21 @@ async def _play_fifo_queue(
 
             done = asyncio.Event()
 
-            def _after(err, path=fifo_path, proc=say_proc):
+            def _after(err, path=file_path):
                 if err:
                     log.error("Playback error: %s", err)
-                proc.wait()   # reap the say process
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
                 bot.loop.call_soon_threadsafe(done.set)
 
-            # Opening the FIFO for reading unblocks say, which then streams
-            # AIFF data through the FIFO into ffmpeg into Discord — all live.
-            source = discord.FFmpegPCMAudio(fifo_path, before_options="-f aiff")
-            vc.play(source, after=_after)
+            vc.play(discord.FFmpegPCMAudio(file_path), after=_after)
             await done.wait()
         except Exception:
-            log.exception("_play_fifo_queue error")
-            say_proc.kill()
+            log.exception("_play_file_queue error")
             try:
-                os.unlink(fifo_path)
+                os.unlink(file_path)
             except OSError:
                 pass
 
@@ -390,13 +406,15 @@ async def shutdown() -> None:
 
 @bot.event
 async def on_ready():
-    global _http_session
+    global _http_session, _tts_engine
     _http_session = aiohttp.ClientSession()
+    _tts_engine = _init_tts_engine()
     log.info("Logged in as %s (id=%d)", bot.user, bot.user.id)
 
-    # Register SIGTERM handler inside the event loop
-    loop = asyncio.get_event_loop()
-    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(shutdown()))
+    # SIGTERM handler — Unix only (Windows doesn't support add_signal_handler)
+    if sys.platform != "win32":
+        loop = asyncio.get_event_loop()
+        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(shutdown()))
 
 
 @bot.event
@@ -408,7 +426,6 @@ async def on_voice_state_update(
     if member.id != OWNER_ID:
         return
 
-    # Use member.guild directly — works across guilds, no GUILD_ID needed
     guild = member.guild
     vc: voice_recv.VoiceRecvClient | None = discord.utils.get(
         bot.voice_clients, guild=guild
@@ -444,21 +461,19 @@ async def join_channel(
 
     await asyncio.sleep(0.5)
 
-    # Greeting via FIFO pipe (same low-latency path)
-    item = await _tts_start("Hey, I'm here.")
-    if item:
-        fifo_path, say_proc = item
+    # Greeting
+    greeting_path = await _tts_start("Hey, I'm here.")
+    if greeting_path:
         done = asyncio.Event()
 
-        def _after(err, path=fifo_path, proc=say_proc):
-            proc.wait()
+        def _after(err, path=greeting_path):
             try:
                 os.unlink(path)
             except OSError:
                 pass
             bot.loop.call_soon_threadsafe(done.set)
 
-        vc.play(discord.FFmpegPCMAudio(fifo_path, before_options="-f aiff"), after=_after)
+        vc.play(discord.FFmpegPCMAudio(greeting_path), after=_after)
         await done.wait()
 
 
