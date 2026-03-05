@@ -38,7 +38,7 @@ import discord
 import litellm
 import numpy as np
 import soundfile as sf
-from kokoro import KPipeline
+from kokoro_onnx import Kokoro
 from discord.ext import voice_recv
 from discord.opus import Decoder as OpusDecoder
 from dotenv import load_dotenv
@@ -69,12 +69,14 @@ WHISPER_URL      = os.environ.get("WHISPER_URL", "http://127.0.0.1:8765/inferenc
 MODEL            = os.environ.get("LLM_MODEL", "claude-haiku-4-5-20251001")
 TTS_VOICE        = os.environ.get("TTS_VOICE", "af_heart")
 TTS_SPEED        = float(os.environ.get("TTS_SPEED", "1.0"))
+# Paths to the ONNX model and voices files (downloaded separately — see README)
+KOKORO_MODEL     = os.environ.get("KOKORO_MODEL", os.path.expanduser("~/.cache/kokoro-onnx/kokoro-v1.0.int8.onnx"))
+KOKORO_VOICES    = os.environ.get("KOKORO_VOICES", os.path.expanduser("~/.cache/kokoro-onnx/voices-v1.0.bin"))
+# Path to libespeak-ng shared library (macOS: /opt/homebrew/lib/libespeak-ng.dylib)
+ESPEAK_LIB       = os.environ.get("ESPEAK_LIB", "")
 SILENCE_SEC      = float(os.environ.get("SILENCE_SEC", "0.7"))
 MIN_DURATION_SEC = float(os.environ.get("MIN_DURATION_SEC", "0.4"))
 MAX_HISTORY      = 10
-
-# Kokoro lang_code is derived from the voice prefix (a=American, b=British, j=Japanese)
-_LANG_CODE = TTS_VOICE[0] if TTS_VOICE else "a"
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+|(?<=[.!?])$')
 
@@ -96,8 +98,8 @@ else:
 
 conversation_history: list = []
 _speaking = threading.Event()          # set while bot is playing TTS
-_kokoro: KPipeline | None = None
-_tts_lock = threading.Lock()           # KPipeline is not thread-safe
+_kokoro: Kokoro | None = None
+_tts_lock = threading.Lock()           # Kokoro is not thread-safe
 _http_session: aiohttp.ClientSession | None = None
 
 # ── Discord setup ─────────────────────────────────────────────────────────────
@@ -109,16 +111,21 @@ bot = discord.Client(intents=intents)
 
 # ── TTS (Kokoro) ──────────────────────────────────────────────────────────────
 
-def _init_kokoro() -> KPipeline:
+def _init_kokoro() -> Kokoro:
     """
-    Initialize the Kokoro pipeline. Downloads the model on first run (~350MB,
-    cached to ~/.cache/huggingface/). Subsequent runs are fully offline.
-    Uses Apple Silicon MPS or CUDA if available, otherwise CPU.
+    Load the Kokoro ONNX model. Model files must be downloaded separately (see README).
+    Runs on CPU by default; set ONNX_PROVIDER=CoreMLExecutionProvider on Apple Silicon
+    or ONNX_PROVIDER=CUDAExecutionProvider on NVIDIA for faster inference.
     """
-    log.info("Loading Kokoro TTS model (may download on first run)...")
-    pipeline = KPipeline(lang_code=_LANG_CODE)
+    if ESPEAK_LIB:
+        # Tell phonemizer where to find libespeak-ng when it's not on the system PATH
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+        EspeakWrapper.set_library(ESPEAK_LIB)
+
+    log.info("Loading Kokoro model from %s ...", KOKORO_MODEL)
+    kokoro = Kokoro(model_path=KOKORO_MODEL, voices_path=KOKORO_VOICES)
     log.info("Kokoro ready — voice=%s speed=%.1f", TTS_VOICE, TTS_SPEED)
-    return pipeline
+    return kokoro
 
 
 async def _tts_start(text: str) -> str | None:
@@ -133,13 +140,8 @@ async def _tts_start(text: str) -> str | None:
 
     def _generate() -> None:
         with _tts_lock:
-            chunks = []
-            for _, _, audio in _kokoro(text, voice=TTS_VOICE, speed=TTS_SPEED):
-                chunks.append(audio)
-            if not chunks:
-                raise RuntimeError("Kokoro returned no audio")
-            full_audio = np.concatenate(chunks)
-            sf.write(tmp_path, full_audio, 24000)
+            samples, sample_rate = _kokoro.create(text, voice=TTS_VOICE, speed=TTS_SPEED)
+            sf.write(tmp_path, samples, sample_rate)
 
     try:
         t0 = time.monotonic()

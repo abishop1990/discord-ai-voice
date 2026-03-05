@@ -5,6 +5,6 @@ aiohttp>=3.9
 davey>=0.1
 PyNaCl>=1.5
 python-dotenv>=1.0
-kokoro>=0.9
+kokoro-onnx>=0.3
 soundfile>=0.12
 numpy>=1.24
