@@ -77,7 +77,9 @@ KOKORO_VOICES    = os.environ.get("KOKORO_VOICES", os.path.expanduser("~/.cache/
 ESPEAK_LIB       = os.environ.get("ESPEAK_LIB", "")
 SILENCE_SEC      = float(os.environ.get("SILENCE_SEC", "0.7"))
 MIN_DURATION_SEC = float(os.environ.get("MIN_DURATION_SEC", "0.4"))
-MAX_HISTORY      = 10
+MAX_HISTORY         = 10
+BOT_NAME            = os.environ.get("BOT_NAME", "bot")          # name to listen for in transcripts
+CONVERSATION_WINDOW = float(os.environ.get("CONVERSATION_WINDOW", "30"))  # seconds of follow-up window
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+|(?<=[.!?])$')
 
@@ -98,6 +100,7 @@ else:
 # ── State ─────────────────────────────────────────────────────────────────────
 
 conversation_history: list = []
+_last_addressed: float = 0.0   # monotonic time of last utterance that named the bot
 _speaking = threading.Event()          # set while bot is playing TTS
 _kokoro: Kokoro | None = None
 _tts_lock = threading.Lock()           # Kokoro is not thread-safe
@@ -238,6 +241,22 @@ class VoiceSink(voice_recv.AudioSink):
                 return
 
             log.info("[STT %.0fms] Heard: %r", stt_ms, transcript)
+
+            # Addressing gate: respond only when named, or within conversation window
+            global _last_addressed
+            t_now = time.monotonic()
+            named = BOT_NAME.lower() in transcript.lower()
+            in_window = (t_now - _last_addressed) <= CONVERSATION_WINDOW
+            if named:
+                _last_addressed = t_now
+                log.info("Named directly — responding")
+            elif in_window:
+                log.info("In conversation window (%.0fs left) — responding",
+                         CONVERSATION_WINDOW - (t_now - _last_addressed))
+            else:
+                log.info("[silent — not addressed] %r", transcript)
+                return
+
             await respond(transcript, self._vc)
         except Exception:
             log.exception("Error in _process")
@@ -476,8 +495,9 @@ async def join_channel(
     channel: discord.VoiceChannel,
     existing_vc: voice_recv.VoiceRecvClient | None,
 ) -> None:
-    global conversation_history
+    global conversation_history, _last_addressed
     conversation_history = []
+    _last_addressed = 0.0
     _speaking.clear()
 
     if existing_vc:
